@@ -1,6 +1,12 @@
-#include "cache.h"
+#include "git-compat-util.h"
+#include "copy.h"
 #include "pkt-line.h"
+#include "gettext.h"
+#include "hex.h"
 #include "run-command.h"
+#include "sideband.h"
+#include "trace.h"
+#include "write-or-die.h"
 
 char packet_buffer[LARGE_PACKET_MAX];
 static const char *packet_trace_prefix = "git";
@@ -33,7 +39,6 @@ static int packet_trace_pack(const char *buf, unsigned int len, int sideband)
 
 static void packet_trace(const char *buf, unsigned int len, int write)
 {
-	int i;
 	struct strbuf out;
 	static int in_pack, sideband;
 
@@ -66,7 +71,7 @@ static void packet_trace(const char *buf, unsigned int len, int write)
 		    get_trace_prefix(), write ? '>' : '<');
 
 	/* XXX we should really handle printable utf8 */
-	for (i = 0; i < len; i++) {
+	for (unsigned int i = 0; i < len; i++) {
 		/* suppress newlines */
 		if (buf[i] == '\n')
 			continue;
@@ -289,22 +294,6 @@ void packet_buf_write(struct strbuf *buf, const char *fmt, ...)
 	va_end(args);
 }
 
-void packet_buf_write_len(struct strbuf *buf, const char *data, size_t len)
-{
-	size_t orig_len, n;
-
-	orig_len = buf->len;
-	strbuf_addstr(buf, "0000");
-	strbuf_add(buf, data, len);
-	n = buf->len - orig_len;
-
-	if (n > LARGE_PACKET_MAX)
-		die(_("protocol error: impossibly long line"));
-
-	set_packet_header(&buf->buf[orig_len], n);
-	packet_trace(data, len, 1);
-}
-
 int write_packetized_from_fd_no_flush(int fd_in, int fd_out)
 {
 	char *buf = xmalloc(LARGE_PACKET_DATA_MAX);
@@ -325,7 +314,8 @@ int write_packetized_from_fd_no_flush(int fd_in, int fd_out)
 	return err;
 }
 
-int write_packetized_from_buf_no_flush(const char *src_in, size_t len, int fd_out)
+int write_packetized_from_buf_no_flush_count(const char *src_in, size_t len,
+					     int fd_out, int *packet_counter)
 {
 	int err = 0;
 	size_t bytes_written = 0;
@@ -340,35 +330,39 @@ int write_packetized_from_buf_no_flush(const char *src_in, size_t len, int fd_ou
 			break;
 		err = packet_write_gently(fd_out, src_in + bytes_written, bytes_to_write);
 		bytes_written += bytes_to_write;
+		if (packet_counter)
+			(*packet_counter)++;
 	}
 	return err;
 }
 
 static int get_packet_data(int fd, char **src_buf, size_t *src_size,
-			   void *dst, unsigned size, int options)
+			   void *dst, size_t size, int options)
 {
-	ssize_t ret;
+	size_t bytes_read;
 
 	if (fd >= 0 && src_buf && *src_buf)
 		BUG("multiple sources given to packet_read");
 
 	/* Read up to "size" bytes from our source, whatever it is. */
 	if (src_buf && *src_buf) {
-		ret = size < *src_size ? size : *src_size;
-		memcpy(dst, *src_buf, ret);
-		*src_buf += ret;
-		*src_size -= ret;
+		bytes_read = size < *src_size ? size : *src_size;
+		memcpy(dst, *src_buf, bytes_read);
+		*src_buf += bytes_read;
+		*src_size -= bytes_read;
 	} else {
-		ret = read_in_full(fd, dst, size);
+		ssize_t ret = read_in_full(fd, dst, size);
 		if (ret < 0) {
 			if (options & PACKET_READ_GENTLE_ON_READ_ERROR)
 				return error_errno(_("read error"));
 			die_errno(_("read error"));
 		}
+
+		bytes_read = (size_t) ret;
 	}
 
 	/* And complain if we didn't get enough bytes to satisfy the read. */
-	if (ret != size) {
+	if (bytes_read != size) {
 		if (options & PACKET_READ_GENTLE_ON_EOF)
 			return -1;
 
@@ -377,13 +371,43 @@ static int get_packet_data(int fd, char **src_buf, size_t *src_size,
 		die(_("the remote end hung up unexpectedly"));
 	}
 
-	return ret;
+	return 0;
 }
 
-int packet_length(const char lenbuf_hex[4])
+int packet_length(const char lenbuf_hex[4], size_t size)
 {
-	int val = hex2chr(lenbuf_hex);
-	return (val < 0) ? val : (val << 8) | hex2chr(lenbuf_hex + 2);
+	if (size < 4)
+		BUG("buffer too small");
+	return	hexval(lenbuf_hex[0]) << 12 |
+		hexval(lenbuf_hex[1]) <<  8 |
+		hexval(lenbuf_hex[2]) <<  4 |
+		hexval(lenbuf_hex[3]);
+}
+
+static char *find_packfile_uri_path(const char *buffer)
+{
+	const char *URI_MARK = "://";
+	char *path;
+	int len;
+
+	/* First char is sideband mark */
+	buffer += 1;
+
+	len = strspn(buffer, "0123456789abcdefABCDEF");
+	/* size of SHA1 and SHA256 hash */
+	if (!(len == 40 || len == 64) || buffer[len] != ' ')
+		return NULL; /* required "<hash>SP" not seen */
+
+	path = strstr(buffer + len + 1, URI_MARK);
+	if (!path)
+		return NULL;
+
+	path = strchr(path + strlen(URI_MARK), '/');
+	if (!path || !*(path + 1))
+		return NULL;
+
+	/* position after '/' */
+	return ++path;
 }
 
 enum packet_read_status packet_read_with_status(int fd, char **src_buffer,
@@ -393,13 +417,14 @@ enum packet_read_status packet_read_with_status(int fd, char **src_buffer,
 {
 	int len;
 	char linelen[4];
+	char *uri_path_start;
 
 	if (get_packet_data(fd, src_buffer, src_len, linelen, 4, options) < 0) {
 		*pktlen = -1;
 		return PACKET_READ_EOF;
 	}
 
-	len = packet_length(linelen);
+	len = packet_length(linelen, sizeof(linelen));
 
 	if (len < 0) {
 		if (options & PACKET_READ_GENTLE_ON_READ_ERROR)
@@ -439,11 +464,46 @@ enum packet_read_status packet_read_with_status(int fd, char **src_buffer,
 	}
 
 	if ((options & PACKET_READ_CHOMP_NEWLINE) &&
-	    len && buffer[len-1] == '\n')
-		len--;
+	    len && buffer[len-1] == '\n') {
+		if (options & PACKET_READ_USE_SIDEBAND) {
+			int band = *buffer & 0xff;
+			switch (band) {
+			case 1:
+				/* Chomp newline for payload */
+				len--;
+				break;
+			case 2:
+			case 3:
+				/*
+				 * Do not chomp newline for progress and error
+				 * message.
+				 */
+				break;
+			default:
+				/*
+				 * Bad sideband, let's leave it to
+				 * demultiplex_sideband() to catch this error.
+				 */
+				break;
+			}
+		} else {
+			len--;
+		}
+	}
 
 	buffer[len] = 0;
-	packet_trace(buffer, len, 0);
+	if (options & PACKET_READ_REDACT_URI_PATH &&
+	    (uri_path_start = find_packfile_uri_path(buffer))) {
+		const char *redacted = "<redacted>";
+		struct strbuf tracebuf = STRBUF_INIT;
+		strbuf_insert(&tracebuf, 0, buffer, len);
+		strbuf_splice(&tracebuf, uri_path_start - buffer,
+			      strlen(uri_path_start), redacted, strlen(redacted));
+		packet_trace(tracebuf.buf, tracebuf.len, 0);
+		strbuf_release(&tracebuf);
+	} else {
+		packet_trace(buffer, len, 0);
+	}
 
 	if ((options & PACKET_READ_DIE_ON_ERR_PACKET) &&
 	    starts_with(buffer, "ERR "))
@@ -453,49 +513,34 @@ enum packet_read_status packet_read_with_status(int fd, char **src_buffer,
 	return PACKET_READ_NORMAL;
 }
 
-int packet_read(int fd, char **src_buffer, size_t *src_len,
-		char *buffer, unsigned size, int options)
+int packet_read(int fd, char *buffer, unsigned size, int options)
 {
 	int pktlen = -1;
 
-	packet_read_with_status(fd, src_buffer, src_len, buffer, size,
-				&pktlen, options);
+	packet_read_with_status(fd, NULL, NULL, buffer, size, &pktlen,
+				options);
 
 	return pktlen;
 }
 
-static char *packet_read_line_generic(int fd,
-				      char **src, size_t *src_len,
-				      int *dst_len)
+char *packet_read_line(int fd, int *dst_len)
 {
-	int len = packet_read(fd, src, src_len,
-			      packet_buffer, sizeof(packet_buffer),
+	int len = packet_read(fd, packet_buffer, sizeof(packet_buffer),
 			      PACKET_READ_CHOMP_NEWLINE);
 	if (dst_len)
 		*dst_len = len;
 	return (len > 0) ? packet_buffer : NULL;
 }
 
-char *packet_read_line(int fd, int *len_p)
-{
-	return packet_read_line_generic(fd, NULL, NULL, len_p);
-}
-
 int packet_read_line_gently(int fd, int *dst_len, char **dst_line)
 {
-	int len = packet_read(fd, NULL, NULL,
-			      packet_buffer, sizeof(packet_buffer),
+	int len = packet_read(fd, packet_buffer, sizeof(packet_buffer),
 			      PACKET_READ_CHOMP_NEWLINE|PACKET_READ_GENTLE_ON_EOF);
 	if (dst_len)
 		*dst_len = len;
 	if (dst_line)
 		*dst_line = (len > 0) ? packet_buffer : NULL;
 	return len;
-}
-
-char *packet_read_line_buf(char **src, size_t *src_len, int *dst_len)
-{
-	return packet_read_line_generic(-1, src, src_len, dst_len);
 }
 
 ssize_t read_packetized_to_strbuf(int fd_in, struct strbuf *sb_out, int options)
@@ -507,7 +552,7 @@ ssize_t read_packetized_to_strbuf(int fd_in, struct strbuf *sb_out, int options)
 
 	for (;;) {
 		strbuf_grow(sb_out, LARGE_PACKET_DATA_MAX);
-		packet_len = packet_read(fd_in, NULL, NULL,
+		packet_len = packet_read(fd_in,
 			/* strbuf_grow() above always allocates one extra byte to
 			 * store a '\0' at the end of the string. packet_read()
 			 * writes a '\0' extra byte at the end, too. Let it know
@@ -573,16 +618,18 @@ void packet_reader_init(struct packet_reader *reader, int fd,
 	reader->options = options;
 	reader->me = "git";
 	reader->hash_algo = &hash_algos[GIT_HASH_SHA1];
+	strbuf_init(&reader->scratch, 0);
 }
 
 enum packet_read_status packet_reader_read(struct packet_reader *reader)
 {
-	struct strbuf scratch = STRBUF_INIT;
-
 	if (reader->line_peeked) {
 		reader->line_peeked = 0;
 		return reader->status;
 	}
+
+	if (reader->use_sideband)
+		reader->options |= PACKET_READ_USE_SIDEBAND;
 
 	/*
 	 * Consume all progress packets until a primary payload packet is
@@ -601,7 +648,7 @@ enum packet_read_status packet_reader_read(struct packet_reader *reader)
 			break;
 		if (demultiplex_sideband(reader->me, reader->status,
 					 reader->buffer, reader->pktlen, 1,
-					 &scratch, &sideband_type))
+					 &reader->scratch, &sideband_type))
 			break;
 	}
 

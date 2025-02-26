@@ -9,7 +9,7 @@ TEXTDOMAIN=git
 export TEXTDOMAIN
 if test -z "$GIT_TEXTDOMAINDIR"
 then
-	TEXTDOMAINDIR="@@LOCALEDIR@@"
+	TEXTDOMAINDIR="@LOCALEDIR@"
 else
 	TEXTDOMAINDIR="$GIT_TEXTDOMAINDIR"
 fi
@@ -17,9 +17,9 @@ export TEXTDOMAINDIR
 
 # First decide what scheme to use...
 GIT_INTERNAL_GETTEXT_SH_SCHEME=fallthrough
-if test -n "@@USE_GETTEXT_SCHEME@@"
+if test -n "@USE_GETTEXT_SCHEME@"
 then
-	GIT_INTERNAL_GETTEXT_SH_SCHEME="@@USE_GETTEXT_SCHEME@@"
+	GIT_INTERNAL_GETTEXT_SH_SCHEME="@USE_GETTEXT_SCHEME@"
 elif test -n "$GIT_INTERNAL_GETTEXT_TEST_FALLBACKS"
 then
 	: no probing necessary
@@ -51,12 +51,6 @@ gettext_without_eval_gettext)
 		)
 	}
 
-	eval_ngettext () {
-		ngettext "$1" "$2" "$3" | (
-			export PATH $(git sh-i18n--envsubst --variables "$2");
-			git sh-i18n--envsubst "$2"
-		)
-	}
 	;;
 *)
 	gettext () {
@@ -70,12 +64,6 @@ gettext_without_eval_gettext)
 		)
 	}
 
-	eval_ngettext () {
-		(test "$3" = 1 && printf "%s" "$1" || printf "%s" "$2") | (
-			export PATH $(git sh-i18n--envsubst --variables "$2");
-			git sh-i18n--envsubst "$2"
-		)
-	}
 	;;
 esac
 

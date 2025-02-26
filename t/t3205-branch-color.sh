@@ -1,9 +1,6 @@
 #!/bin/sh
 
 test_description='basic branch output coloring'
-GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
-export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
-
 . ./test-lib.sh
 
 test_expect_success 'set up some sample branches' '

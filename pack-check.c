@@ -1,10 +1,15 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "environment.h"
+#include "hex.h"
 #include "repository.h"
 #include "pack.h"
-#include "pack-revindex.h"
 #include "progress.h"
 #include "packfile.h"
-#include "object-store.h"
+#include "object-file.h"
+#include "object-store-ll.h"
 
 struct idx_entry {
 	off_t                offset;
@@ -53,7 +58,7 @@ static int verify_packfile(struct repository *r,
 {
 	off_t index_size = p->index_size;
 	const unsigned char *index_base = p->index_data;
-	git_hash_ctx ctx;
+	struct git_hash_ctx ctx;
 	unsigned char hash[GIT_MAX_RAWSZ], *pack_sig;
 	off_t offset = 0, pack_sig_ofs = 0;
 	uint32_t nr_objects, i;
@@ -72,14 +77,15 @@ static int verify_packfile(struct repository *r,
 			pack_sig_ofs = p->pack_size - r->hash_algo->rawsz;
 		if (offset > pack_sig_ofs)
 			remaining -= (unsigned int)(offset - pack_sig_ofs);
-		r->hash_algo->update_fn(&ctx, in, remaining);
+		git_hash_update(&ctx, in, remaining);
 	} while (offset < pack_sig_ofs);
-	r->hash_algo->final_fn(hash, &ctx);
+	git_hash_final(hash, &ctx);
 	pack_sig = use_pack(p, w_curs, pack_sig_ofs, NULL);
-	if (!hasheq(hash, pack_sig))
+	if (!hasheq(hash, pack_sig, the_repository->hash_algo))
 		err = error("%s pack checksum mismatch",
 			    p->pack_name);
-	if (!hasheq(index_base + index_size - r->hash_algo->hexsz, pack_sig))
+	if (!hasheq(index_base + index_size - r->hash_algo->hexsz, pack_sig,
+		    the_repository->hash_algo))
 		err = error("%s pack checksum does not match its index",
 			    p->pack_name);
 	unuse_pack(w_curs);
@@ -127,7 +133,7 @@ static int verify_packfile(struct repository *r,
 
 		if (type == OBJ_BLOB && big_file_threshold <= size) {
 			/*
-			 * Let check_object_signature() check it with
+			 * Let stream_object_signature() check it with
 			 * the streaming interface; no point slurping
 			 * the data in-core only to discard.
 			 */
@@ -142,7 +148,11 @@ static int verify_packfile(struct repository *r,
 			err = error("cannot unpack %s from %s at offset %"PRIuMAX"",
 				    oid_to_hex(&oid), p->pack_name,
 				    (uintmax_t)entries[i].offset);
-		else if (check_object_signature(r, &oid, data, size, type_name(type)))
+		else if (data && check_object_signature(r, &oid, data, size,
+							type) < 0)
+			err = error("packed %s from %s is corrupt",
+				    oid_to_hex(&oid), p->pack_name);
+		else if (!data && stream_object_signature(r, &oid) < 0)
 			err = error("packed %s from %s is corrupt",
 				    oid_to_hex(&oid), p->pack_name);
 		else if (fn) {

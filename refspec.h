@@ -2,7 +2,6 @@
 #define REFSPEC_H
 
 #define TAG_REFSPEC "refs/tags/*:refs/tags/*"
-extern const struct refspec_item *tag_refspec;
 
 /**
  * A struct refspec_item holds the parsed interpretation of a refspec.  If it
@@ -27,7 +26,11 @@ struct refspec_item {
 
 	char *src;
 	char *dst;
+
+	char *raw;
 };
+
+struct string_list;
 
 #define REFSPEC_FETCH 1
 #define REFSPEC_PUSH 0
@@ -43,10 +46,6 @@ struct refspec {
 	struct refspec_item *items;
 	int alloc;
 	int nr;
-
-	const char **raw;
-	int raw_alloc;
-	int raw_nr;
 
 	int fetch;
 };
@@ -64,14 +63,49 @@ void refspec_appendn(struct refspec *rs, const char **refspecs, int nr);
 void refspec_clear(struct refspec *rs);
 
 int valid_fetch_refspec(const char *refspec);
-int valid_remote_name(const char *name);
 
 struct strvec;
 /*
  * Determine what <prefix> values to pass to the peer in ref-prefix lines
- * (see Documentation/technical/protocol-v2.txt).
+ * (see linkgit:gitprotocol-v2[5]).
  */
 void refspec_ref_prefixes(const struct refspec *rs,
 			  struct strvec *ref_prefixes);
+
+int refname_matches_negative_refspec_item(const char *refname, struct refspec *rs);
+
+/*
+ * Checks if a refname matches a globbing refspec pattern.
+ * If replacement is provided, computes the corresponding mapped refname.
+ * Returns 1 if refname matches pattern, 0 otherwise.
+ */
+int match_refname_with_pattern(const char *pattern, const char *refname,
+				   const char *replacement, char **result);
+
+/*
+ * Queries a refspec for a match and updates the query item.
+ * Returns 0 on success, -1 if no match is found or negative refspec matches.
+ */
+int refspec_find_match(struct refspec *rs, struct refspec_item *query);
+
+/*
+ * Queries a refspec for all matches and appends results to the provided string
+ * list.
+ */
+void refspec_find_all_matches(struct refspec *rs,
+				    struct refspec_item *query,
+				    struct string_list *results);
+
+/*
+ * Remove all entries in the input list which match any negative refspec in
+ * the refspec list.
+ */
+struct ref *apply_negative_refspecs(struct ref *ref_map, struct refspec *rs);
+
+/*
+ * Search for a refspec that matches the given name and return the
+ * corresponding destination (dst) if a match is found, NULL otherwise.
+ */
+char *apply_refspecs(struct refspec *rs, const char *name);
 
 #endif /* REFSPEC_H */

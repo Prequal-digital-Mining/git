@@ -1,8 +1,9 @@
-#include "cache.h"
+#include "git-compat-util.h"
+#include "gettext.h"
 #include "simple-ipc.h"
 #include "strbuf.h"
-#include "pkt-line.h"
 #include "thread-utils.h"
+#include "trace2.h"
 #include "unix-socket.h"
 #include "unix-stream-server.h"
 
@@ -34,6 +35,28 @@ enum ipc_active_state ipc_get_active_state(const char *path)
 			return IPC_STATE__INVALID_PATH;
 		}
 	}
+
+#ifdef __CYGWIN__
+	/*
+	 * Cygwin emulates Unix sockets by writing special-crafted files whose
+	 * `system` bit is set.
+	 *
+	 * If we are too fast, Cygwin might still be in the process of marking
+	 * the underlying file as a system file. Until then, we will not see a
+	 * Unix socket here, but a plain file instead. Just in case that this
+	 * is happening, wait a little and try again.
+	 */
+	{
+		static const int delay[] = { 1, 10, 20, 40, -1 };
+		int i;
+
+		for (i = 0; S_ISREG(st.st_mode) && delay[i] > 0; i++) {
+			sleep_millisec(delay[i]);
+			if (lstat(path, &st) == -1)
+				return IPC_STATE__INVALID_PATH;
+		}
+	}
+#endif
 
 	/* also complain if a plain file is in the way */
 	if ((st.st_mode & S_IFMT) != S_IFSOCK)
@@ -168,7 +191,8 @@ void ipc_client_close_connection(struct ipc_client_connection *connection)
 
 int ipc_client_send_command_to_connection(
 	struct ipc_client_connection *connection,
-	const char *message, struct strbuf *answer)
+	const char *message, size_t message_len,
+	struct strbuf *answer)
 {
 	int ret = 0;
 
@@ -176,7 +200,7 @@ int ipc_client_send_command_to_connection(
 
 	trace2_region_enter("ipc-client", "send-command", NULL);
 
-	if (write_packetized_from_buf_no_flush(message, strlen(message),
+	if (write_packetized_from_buf_no_flush(message, message_len,
 					       connection->fd) < 0 ||
 	    packet_flush_gently(connection->fd) < 0) {
 		ret = error(_("could not send IPC command"));
@@ -197,7 +221,8 @@ done:
 
 int ipc_client_send_command(const char *path,
 			    const struct ipc_client_connect_options *options,
-			    const char *message, struct strbuf *answer)
+			    const char *message, size_t message_len,
+			    struct strbuf *answer)
 {
 	int ret = -1;
 	enum ipc_active_state state;
@@ -208,7 +233,9 @@ int ipc_client_send_command(const char *path,
 	if (state != IPC_STATE__LISTENING)
 		return ret;
 
-	ret = ipc_client_send_command_to_connection(connection, message, answer);
+	ret = ipc_client_send_command_to_connection(connection,
+						    message, message_len,
+						    answer);
 
 	ipc_client_close_connection(connection);
 
@@ -301,6 +328,7 @@ struct ipc_server_data {
 	int back_pos;
 	int front_pos;
 
+	int started;
 	int shutdown_requested;
 	int is_stopped;
 };
@@ -503,7 +531,7 @@ static int worker_thread__do_io(
 	if (ret >= 0) {
 		ret = worker_thread_data->server_data->application_cb(
 			worker_thread_data->server_data->application_data,
-			buf.buf, do_io_reply_callback, &reply_data);
+			buf.buf, buf.len, do_io_reply_callback, &reply_data);
 
 		packet_flush_gently(reply_data.fd);
 	}
@@ -685,7 +713,7 @@ static int accept_thread__wait_for_connection(
  * Block SIGPIPE in this thread for the life of the thread.  This
  * avoids any stray SIGPIPE signals when closing pipe fds under
  * extremely heavy loads (such as when the fifo queue is full and we
- * drop incomming connections).
+ * drop incoming connections).
  */
 static void *accept_thread_proc(void *_accept_thread_data)
 {
@@ -797,10 +825,10 @@ static int setup_listener_socket(
 /*
  * Start IPC server in a pool of background threads.
  */
-int ipc_server_run_async(struct ipc_server_data **returned_server_data,
-			 const char *path, const struct ipc_server_opts *opts,
-			 ipc_server_application_cb *application_cb,
-			 void *application_data)
+int ipc_server_init_async(struct ipc_server_data **returned_server_data,
+			  const char *path, const struct ipc_server_opts *opts,
+			  ipc_server_application_cb *application_cb,
+			  void *application_data)
 {
 	struct unix_ss_socket *server_socket = NULL;
 	struct ipc_server_data *server_data;
@@ -861,6 +889,12 @@ int ipc_server_run_async(struct ipc_server_data **returned_server_data,
 	server_data->accept_thread->fd_send_shutdown = sv[0];
 	server_data->accept_thread->fd_wait_shutdown = sv[1];
 
+	/*
+	 * Hold work-available mutex so that no work can start until
+	 * we unlock it.
+	 */
+	pthread_mutex_lock(&server_data->work_available_mutex);
+
 	if (pthread_create(&server_data->accept_thread->pthread_id, NULL,
 			   accept_thread_proc, server_data->accept_thread))
 		die_errno(_("could not start accept_thread '%s'"), path);
@@ -891,6 +925,15 @@ int ipc_server_run_async(struct ipc_server_data **returned_server_data,
 	return 0;
 }
 
+void ipc_server_start_async(struct ipc_server_data *server_data)
+{
+	if (!server_data || server_data->started)
+		return;
+
+	server_data->started = 1;
+	pthread_mutex_unlock(&server_data->work_available_mutex);
+}
+
 /*
  * Gently tell the IPC server treads to shutdown.
  * Can be run on any thread.
@@ -906,7 +949,9 @@ int ipc_server_stop_async(struct ipc_server_data *server_data)
 
 	trace2_region_enter("ipc-server", "server-stop-async", NULL);
 
-	pthread_mutex_lock(&server_data->work_available_mutex);
+	/* If we haven't started yet, we are already holding lock. */
+	if (server_data->started)
+		pthread_mutex_lock(&server_data->work_available_mutex);
 
 	server_data->shutdown_requested = 1;
 

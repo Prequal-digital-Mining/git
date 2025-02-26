@@ -1,9 +1,14 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
 #include "config.h"
 #include "entry.h"
+#include "gettext.h"
 #include "parallel-checkout.h"
 #include "parse-options.h"
 #include "pkt-line.h"
+#include "read-cache-ll.h"
 
 static void packet_to_pc_item(const char *buffer, int len,
 			      struct parallel_checkout_item *pc_item)
@@ -82,8 +87,8 @@ static void worker_loop(struct checkout *state)
 	size_t i, nr = 0, alloc = 0;
 
 	while (1) {
-		int len = packet_read(0, NULL, NULL, packet_buffer,
-				      sizeof(packet_buffer), 0);
+		int len = packet_read(0, packet_buffer, sizeof(packet_buffer),
+				      0);
 
 		if (len < 0)
 			BUG("packet_read() returned negative value");
@@ -111,7 +116,10 @@ static const char * const checkout_worker_usage[] = {
 	NULL
 };
 
-int cmd_checkout__worker(int argc, const char **argv, const char *prefix)
+int cmd_checkout__worker(int argc,
+			 const char **argv,
+			 const char *prefix,
+			 struct repository *repo UNUSED)
 {
 	struct checkout state = CHECKOUT_INIT;
 	struct option checkout_worker_options[] = {
@@ -120,9 +128,9 @@ int cmd_checkout__worker(int argc, const char **argv, const char *prefix)
 		OPT_END()
 	};
 
-	if (argc == 2 && !strcmp(argv[1], "-h"))
-		usage_with_options(checkout_worker_usage,
-				   checkout_worker_options);
+	show_usage_with_options_if_asked(argc, argv,
+					 checkout_worker_usage,
+					 checkout_worker_options);
 
 	git_config(git_default_config, NULL);
 	argc = parse_options(argc, argv, prefix, checkout_worker_options,
